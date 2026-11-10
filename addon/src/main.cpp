@@ -1,4 +1,5 @@
-// RealFluid - milestone 2b (step 2): telemetry + screen-space test markers, hidden behind scene depth.
+// RealFluid - milestone 3: GPU fluid solver (3D grid) + volume ray-march for tire smoke.
+// (Also still contains the 2a/2b tire markers, off by default: markers=1 turns them on.)
 //
 //   * registers with ReShade as an add-on,
 //   * listens on UDP 127.0.0.1:43871 for the BeamNG Lua sender (see src/protocol.hpp),
@@ -8,7 +9,8 @@
 //     hide markers behind the car/objects by reading the game's depth buffer (set depthTest=0 to turn that off),
 //   * logs once per second (realfluid.log, next to the game exe, else %TEMP%).
 //
-// Optional realfluid.ini next to the .addon: overlay=1|0, fovVertical=1|0, markerScale=100, depthTest=1|0, depthTolCm=40
+// Optional realfluid.ini next to the .addon: overlay=1|0, fovVertical=1|0, markerScale=100, depthTest=1|0, depthTolCm=100, smoke=1|0, markers=1|0,
+// smokeDensity=100, smokeEmit=100, cellCm=40
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #define _CRT_SECURE_NO_WARNINGS
@@ -19,6 +21,7 @@
 
 #include <reshade.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -318,7 +321,8 @@ bool g_pipelineFailed = false;
 constexpr int kMaxMarkers = 8;
 // header(4) + 8 markers x 4 + 8 view depths (2 float4) = 44 DWORDs (root signature limit is 64, one more for the depth table)
 constexpr uint32_t kConstCount = 4 + 4 * kMaxMarkers + kMaxMarkers;
-std::atomic<int> g_cfgDepthTest{1}, g_cfgDepthTolCm{40};
+std::atomic<int> g_cfgDepthTest{1}, g_cfgDepthTolCm{100};
+std::atomic<int> g_cfgSmoke{1}, g_cfgMarkers{0}, g_cfgSmokeDensity{100}, g_cfgSmokeEmit{100}, g_cfgCellCm{40};
 
 void readConfig() {
     std::string path = g_dllDir + "realfluid.ini";
@@ -327,8 +331,16 @@ void readConfig() {
     int scale = static_cast<int>(GetPrivateProfileIntA("realfluid", "markerScale", 100, path.c_str()));
     g_cfgScale = scale < 20 ? 20 : (scale > 400 ? 400 : scale);
     g_cfgDepthTest = static_cast<int>(GetPrivateProfileIntA("realfluid", "depthTest", 1, path.c_str()));
-    int tol = static_cast<int>(GetPrivateProfileIntA("realfluid", "depthTolCm", 40, path.c_str()));
+    int tol = static_cast<int>(GetPrivateProfileIntA("realfluid", "depthTolCm", 100, path.c_str()));
     g_cfgDepthTolCm = tol < 5 ? 5 : (tol > 300 ? 300 : tol);
+    g_cfgSmoke = static_cast<int>(GetPrivateProfileIntA("realfluid", "smoke", 1, path.c_str()));
+    g_cfgMarkers = static_cast<int>(GetPrivateProfileIntA("realfluid", "markers", 0, path.c_str()));
+    int sd = static_cast<int>(GetPrivateProfileIntA("realfluid", "smokeDensity", 100, path.c_str()));
+    g_cfgSmokeDensity = sd < 10 ? 10 : (sd > 500 ? 500 : sd);
+    int se = static_cast<int>(GetPrivateProfileIntA("realfluid", "smokeEmit", 100, path.c_str()));
+    g_cfgSmokeEmit = se < 5 ? 5 : (se > 500 ? 500 : se);
+    int cc = static_cast<int>(GetPrivateProfileIntA("realfluid", "cellCm", 40, path.c_str()));
+    g_cfgCellCm = cc < 15 ? 15 : (cc > 100 ? 100 : cc);
 }
 
 const char *kShaderSource = R"HLSL(
@@ -423,6 +435,690 @@ bool compileShader(const char *entry, const char *target, bool withDepth, std::v
     return true;
 }
 
+// ---------------------------------------------------------------- 3D smoke: fluid solver + ray-march
+constexpr int NX = 128, NY = 128, NZ = 64;       // grid cells (x, y, z; z = world up)
+constexpr int kEmit = 6;                         // emitters (tires) per frame
+constexpr uint32_t kSimConsts = 12 + 8 * kEmit;  // 60 DWORDs (+2 descriptor tables = 62 <= 64)
+constexpr uint32_t kRenderConsts = 52;           // 52 DWORDs (+2 tables = 54)
+constexpr int kJacobi = 24;                      // pressure iterations per frame
+std::atomic<int> g_smokeState{0}, g_smokeEmitCount{0};  // 0 off, 1 running, 2 failed
+
+const char *kSimSource = R"HLSL(
+#define NX 128
+#define NY 128
+#define NZ 64
+static const int3 DIMS = int3(NX, NY, NZ);
+Texture3D<float4> tV  : register(t0);
+Texture3D<float>  tS1 : register(t1);
+Texture3D<float>  tS2 : register(t2);
+Texture3D<float4> tC  : register(t3);
+RWTexture3D<float4> uV : register(u0);
+RWTexture3D<float>  uS : register(u1);
+cbuffer P : register(b0) {
+    float4 gO;      // xyz = world position of the grid corner (cell 0,0,0), w = cell size (m)
+    float4 oO;      // xyz = grid corner of the previous frame, w = dt (s)
+    float4 ms;      // x = ground height, y = smoke fade per second, z = buoyancy, w = vorticity strength
+    float4 em[12];  // 6 emitters: em[2k] = (pos xyz, radius), em[2k+1] = (velocity xyz, intensity)
+};
+bool inside(int3 i) { return all(i >= 0) && all(i < DIMS); }
+float3 cellPos(int3 i) { return gO.xyz + ((float3)i + 0.5) * gO.w; }
+bool isSolid(int3 i) { return cellPos(i).z < ms.x; }
+float4 ldV(int3 i) { return inside(i) ? tV.Load(int4(i, 0)) : float4(0, 0, 0, 0); }
+float ldS(int3 i) { return inside(i) ? tS1.Load(int4(i, 0)) : 0.0; }
+float4 smpV(float3 wp) {
+    float3 g = (wp - oO.xyz) / gO.w - 0.5;
+    float3 fl = floor(g);
+    float3 f = g - fl;
+    int3 i = (int3)fl;
+    float4 a = lerp(lerp(ldV(i), ldV(i + int3(1,0,0)), f.x), lerp(ldV(i + int3(0,1,0)), ldV(i + int3(1,1,0)), f.x), f.y);
+    float4 b = lerp(lerp(ldV(i + int3(0,0,1)), ldV(i + int3(1,0,1)), f.x), lerp(ldV(i + int3(0,1,1)), ldV(i + int3(1,1,1)), f.x), f.y);
+    return lerp(a, b, f.z);
+}
+float smpD(float3 wp) {
+    float3 g = (wp - oO.xyz) / gO.w - 0.5;
+    float3 fl = floor(g);
+    float3 f = g - fl;
+    int3 i = (int3)fl;
+    float a = lerp(lerp(ldS(i), ldS(i + int3(1,0,0)), f.x), lerp(ldS(i + int3(0,1,0)), ldS(i + int3(1,1,0)), f.x), f.y);
+    float b = lerp(lerp(ldS(i + int3(0,0,1)), ldS(i + int3(1,0,1)), f.x), lerp(ldS(i + int3(0,1,1)), ldS(i + int3(1,1,1)), f.x), f.y);
+    return lerp(a, b, f.z);
+}
+static const int3 EX = int3(1,0,0);
+static const int3 EY = int3(0,1,0);
+static const int3 EZ = int3(0,0,1);
+
+[numthreads(8,8,4)] void CSClear(uint3 id : SV_DispatchThreadID) { uS[(int3)id] = 0.0; }
+
+[numthreads(8,8,4)] void CSAdvV(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    if (isSolid(i)) { uV[i] = float4(0,0,0,0); return; }
+    float dt = oO.w;
+    float3 p = cellPos(i);
+    float3 v0 = smpV(p).xyz;
+    float4 nv = smpV(p - v0 * dt);
+    nv.xyz *= exp(-0.4 * dt);
+    nv.w *= exp(-0.9 * dt);
+    nv.z += dt * ms.z * nv.w;                    // hot smoke rises
+    [unroll] for (int e = 0; e < 6; ++e) {
+        float4 a = em[2*e];
+        float4 b = em[2*e+1];
+        if (b.w > 0.0) {
+            float w = saturate(1.0 - length(p - a.xyz) / a.w);
+            w = w * w;
+            nv.xyz += (b.xyz - nv.xyz) * saturate(w * b.w * dt * 12.0);
+            nv.w += w * b.w * dt * 4.0;
+        }
+    }
+    nv.w = min(nv.w, 3.0);
+    float sp = length(nv.xyz);
+    if (sp > 40.0) nv.xyz *= 40.0 / sp;
+    uV[i] = nv;
+}
+
+[numthreads(8,8,4)] void CSCurl(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    float inv = 0.5 / gO.w;
+    float3 dx = ldV(i + EX).xyz - ldV(i - EX).xyz;
+    float3 dy = ldV(i + EY).xyz - ldV(i - EY).xyz;
+    float3 dz = ldV(i + EZ).xyz - ldV(i - EZ).xyz;
+    float3 c = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x) * inv;
+    uV[i] = float4(c, length(c));
+}
+
+float curlMag(int3 i) { return inside(i) ? tC.Load(int4(i, 0)).w : 0.0; }
+[numthreads(8,8,4)] void CSConf(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    float4 v = tV.Load(int4(i, 0));
+    if (isSolid(i)) { uV[i] = float4(0,0,0,0); return; }
+    float inv = 0.5 / gO.w;
+    float3 g = float3(curlMag(i + EX) - curlMag(i - EX), curlMag(i + EY) - curlMag(i - EY), curlMag(i + EZ) - curlMag(i - EZ)) * inv;
+    float3 n = g / (length(g) + 1e-5);
+    float3 w = tC.Load(int4(i, 0)).xyz;
+    v.xyz += ms.w * gO.w * cross(n, w) * oO.w;
+    uV[i] = v;
+}
+
+[numthreads(8,8,4)] void CSDiv(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    if (isSolid(i)) { uS[i] = 0.0; return; }
+    float inv = 0.5 / gO.w;
+    uS[i] = inv * ((ldV(i + EX).x - ldV(i - EX).x) + (ldV(i + EY).y - ldV(i - EY).y) + (ldV(i + EZ).z - ldV(i - EZ).z));
+}
+
+float pAt(int3 n, float pc) {
+    if (!inside(n)) return 0.0;
+    if (isSolid(n)) return pc;
+    return tS1.Load(int4(n, 0));
+}
+[numthreads(8,8,4)] void CSJac(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    if (isSolid(i)) { uS[i] = 0.0; return; }
+    float pc = tS1.Load(int4(i, 0));
+    float sum = pAt(i + EX, pc) + pAt(i - EX, pc) + pAt(i + EY, pc) + pAt(i - EY, pc) + pAt(i + EZ, pc) + pAt(i - EZ, pc);
+    float h = gO.w;
+    uS[i] = (sum - h * h * tS2.Load(int4(i, 0))) / 6.0;
+}
+
+[numthreads(8,8,4)] void CSProj(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    if (isSolid(i)) { uV[i] = float4(0,0,0,0); return; }
+    float4 v = tV.Load(int4(i, 0));
+    float pc = tS1.Load(int4(i, 0));
+    float inv = 0.5 / gO.w;
+    float3 g = float3(pAt(i + EX, pc) - pAt(i - EX, pc), pAt(i + EY, pc) - pAt(i - EY, pc), pAt(i + EZ, pc) - pAt(i - EZ, pc)) * inv;
+    v.xyz -= g;
+    if (isSolid(i - EZ)) v.z = max(v.z, 0.0);
+    uV[i] = v;
+}
+
+[numthreads(8,8,4)] void CSAdvD(uint3 id : SV_DispatchThreadID) {
+    int3 i = (int3)id;
+    if (isSolid(i)) { uS[i] = 0.0; return; }
+    float dt = oO.w;
+    float3 p = cellPos(i);
+    float3 v = ldV(i).xyz;
+    float d = smpD(p - v * dt);
+    d *= exp(-ms.y * dt);
+    [unroll] for (int e = 0; e < 6; ++e) {
+        float4 a = em[2*e];
+        float4 b = em[2*e+1];
+        if (b.w > 0.0) {
+            float w = saturate(1.0 - length(p - a.xyz) / a.w);
+            d += w * w * b.w * dt * 7.0;
+        }
+    }
+    uS[i] = min(d, 3.0);
+}
+)HLSL";
+
+const char *kRenderSource = R"HLSL(
+#define NX 128
+#define NY 128
+#define NZ 64
+Texture3D<float> denTex : register(t0);
+Texture2D<float> depthTex : register(t1);
+SamplerState lin : register(s0);
+cbuffer R : register(b0) {
+    float4 cPos;    // xyz camera position, w = tan(half fov) horizontal
+    float4 cRight;  // xyz camera right,    w = tan(half fov) vertical
+    float4 cUp;     // xyz camera up,       w = 1 if the scene depth can be used
+    float4 cFwd;    // xyz camera forward
+    float4 gOr;     // xyz grid corner, w = cell size
+    float4 sun;     // xyz direction to the sun, w = smoke extinction scale
+    float4 mk[6];   // wheel contact points: xy = pixel, z = view depth (m)
+    float4 rm;      // x = marker count, y = width, z = height
+};
+struct VSOut { float4 pos : SV_Position; };
+VSOut VSMain(uint id : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    return o;
+}
+float4 PSMain(VSOut i) : SV_Target {
+    float2 ndc = float2(i.pos.x / rm.y * 2.0 - 1.0, 1.0 - i.pos.y / rm.z * 2.0);
+    // rd has a forward component of exactly 1, so the ray parameter t is the view depth in metres.
+    float3 rd = cFwd.xyz + cRight.xyz * (ndc.x * cPos.w) + cUp.xyz * (ndc.y * cRight.w);
+    float3 rdS = rd + float3(rd.x >= 0.0 ? 1e-7 : -1e-7, rd.y >= 0.0 ? 1e-7 : -1e-7, rd.z >= 0.0 ? 1e-7 : -1e-7);
+    float3 bmin = gOr.xyz;
+    float3 ext = float3(NX, NY, NZ) * gOr.w;
+    float3 inv = 1.0 / rdS;
+    float3 ta = (bmin - cPos.xyz) * inv;
+    float3 tb = (bmin + ext - cPos.xyz) * inv;
+    float3 tmn = min(ta, tb);
+    float3 tmx = max(ta, tb);
+    float tIn = max(max(tmn.x, tmn.y), max(tmn.z, 0.3));
+    float tOut = min(min(tmx.x, tmx.y), tmx.z);
+    if (tOut <= tIn) return float4(0, 0, 0, 0);
+
+    if (cUp.w > 0.5) {
+        // Hide smoke behind the car and scenery: depth buffer value d = a + b / z (a = 1 normal, 0 reversed).
+        uint tw, th;
+        depthTex.GetDimensions(tw, th);
+        int2 hi = int2((int)tw - 1, (int)th - 1);
+        float dPix = depthTex.Load(int3(clamp(int2(i.pos.xy), int2(0, 0), hi), 0));
+        float bMin = 1e9;
+        float aSel = 1.0;
+        [unroll] for (int k = 0; k < 6; ++k) {
+            if (k < (int)rm.x) {
+                int2 c = clamp(int2(mk[k].xy), int2(0, 0), hi);
+                float dk = depthTex.Load(int3(c, 0));
+                float aS = dk > 0.5 ? 1.0 : 0.0;
+                float bk = abs((dk - aS) * mk[k].z);
+                if (bk < bMin) { bMin = bk; aSel = aS; }
+            }
+        }
+        if (bMin > 1e-4 && bMin < 1e8) {
+            float zs = bMin / max(abs(dPix - aSel), 1e-9);
+            tOut = min(tOut, zs);
+            if (tOut <= tIn) return float4(0, 0, 0, 0);
+        }
+    }
+
+    const int STEPS = 72;
+    float dt = (tOut - tIn) / STEPS;
+    float stepLen = dt * length(rd);
+    float jitter = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));
+    float T = 1.0;
+    float3 col = float3(0, 0, 0);
+    [loop] for (int s = 0; s < STEPS; ++s) {
+        float t = tIn + (s + jitter) * dt;
+        float3 p = cPos.xyz + rd * t;
+        float d = denTex.SampleLevel(lin, (p - bmin) / ext, 0);
+        if (d > 0.004) {
+            float a = 1.0 - exp(-d * sun.w * stepLen);
+            float sh = denTex.SampleLevel(lin, (p + sun.xyz * 0.6 - bmin) / ext, 0)
+                     + denTex.SampleLevel(lin, (p + sun.xyz * 1.4 - bmin) / ext, 0)
+                     + denTex.SampleLevel(lin, (p + sun.xyz * 2.8 - bmin) / ext, 0);
+            float lit = exp(-sh * sun.w * 0.8);
+            float3 L = float3(0.40, 0.44, 0.52) + float3(1.0, 0.96, 0.88) * lit * 0.85;
+            col += T * a * L * 0.8;
+            T *= (1.0 - a);
+            if (T < 0.02) break;
+        }
+    }
+    return float4(col, 1.0 - T);   // premultiplied alpha
+}
+)HLSL";
+
+struct Tex3 {
+    reshade::api::resource res{0};
+    reshade::api::resource_view srv{0}, uav{0};
+    reshade::api::resource_usage state = reshade::api::resource_usage::shader_resource;
+};
+struct Sim {
+    Tex3 V[2], D[2], P[2], DIV, CURL;  // velocity(+temperature), density, pressure, divergence, curl
+    int vc = 0, dc = 0, pc = 0;
+    reshade::api::resource dummyRes{0};
+    reshade::api::resource_view dummySrv{0};
+    reshade::api::sampler smp{0};
+    reshade::api::pipeline_layout layoutC{0}, layoutR{0};
+    reshade::api::pipeline csClear{0}, csAdvV{0}, csCurl{0}, csConf{0}, csDiv{0}, csJac{0}, csProj{0}, csAdvD{0}, psR{0};
+    bool ready = false, failed = false, haveOrigin = false;
+    float origin[3] = {0, 0, 0};
+    ULONGLONG lastTick = 0;
+};
+Sim g_sim;
+
+bool compileFrom(const char *src, const char *entry, const char *target, std::vector<uint8_t> &out) {
+    ID3DBlob *code = nullptr, *errs = nullptr;
+    HRESULT hr = D3DCompile(src, std::strlen(src), "realfluid_smoke", nullptr, nullptr, entry, target,
+                            D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errs);
+    if (FAILED(hr) || !code) {
+        logf("smoke: shader compile failed (%s): %s", entry,
+             errs ? static_cast<const char *>(errs->GetBufferPointer()) : "no message");
+        if (errs) errs->Release();
+        if (code) code->Release();
+        return false;
+    }
+    out.assign(static_cast<const uint8_t *>(code->GetBufferPointer()),
+               static_cast<const uint8_t *>(code->GetBufferPointer()) + code->GetBufferSize());
+    code->Release();
+    if (errs) errs->Release();
+    return true;
+}
+
+void destroyTex3(reshade::api::device *dev, Tex3 &t) {
+    if (t.srv.handle) dev->destroy_resource_view(t.srv);
+    if (t.uav.handle) dev->destroy_resource_view(t.uav);
+    if (t.res.handle) dev->destroy_resource(t.res);
+    t = Tex3{};
+}
+
+void destroySim(reshade::api::device *dev) {
+    Sim &S = g_sim;
+    for (auto &t : S.V) destroyTex3(dev, t);
+    for (auto &t : S.D) destroyTex3(dev, t);
+    for (auto &t : S.P) destroyTex3(dev, t);
+    destroyTex3(dev, S.DIV);
+    destroyTex3(dev, S.CURL);
+    if (S.dummySrv.handle) dev->destroy_resource_view(S.dummySrv);
+    if (S.dummyRes.handle) dev->destroy_resource(S.dummyRes);
+    if (S.smp.handle) dev->destroy_sampler(S.smp);
+    for (reshade::api::pipeline *pp : {&S.csClear, &S.csAdvV, &S.csCurl, &S.csConf, &S.csDiv, &S.csJac, &S.csProj, &S.csAdvD, &S.psR})
+        if (pp->handle) dev->destroy_pipeline(*pp);
+    if (S.layoutC.handle) dev->destroy_pipeline_layout(S.layoutC);
+    if (S.layoutR.handle) dev->destroy_pipeline_layout(S.layoutR);
+    S = Sim{};
+    g_smokeState = 0;
+}
+
+bool makeTex3(reshade::api::device *dev, reshade::api::format fmt, Tex3 &t) {
+    using namespace reshade::api;
+    resource_desc d(NX, NY, NZ, 1, fmt, 1, memory_heap::gpu_only,
+                    resource_usage::shader_resource | resource_usage::unordered_access);
+    d.type = resource_type::texture_3d;
+    if (!dev->create_resource(d, nullptr, resource_usage::shader_resource, &t.res)) return false;
+    if (!dev->create_resource_view(t.res, resource_usage::shader_resource,
+                                   resource_view_desc(resource_view_type::texture_3d, fmt, 0, 1, 0, 1), &t.srv))
+        return false;
+    if (!dev->create_resource_view(t.res, resource_usage::unordered_access,
+                                   resource_view_desc(resource_view_type::texture_3d, fmt, 0, 1, 0, 0xFFFFFFFFu), &t.uav))
+        return false;
+    t.state = resource_usage::shader_resource;
+    return true;
+}
+
+bool createSim(reshade::api::device *dev, reshade::api::format rtFmt) {
+    using namespace reshade::api;
+    Sim &S = g_sim;
+    S.failed = true;
+    g_smokeState = 2;
+    const format f4 = format::r32g32b32a32_float, f1 = format::r32_float;
+    bool ok = true;
+    for (auto &t : S.V) ok = ok && makeTex3(dev, f4, t);
+    for (auto &t : S.D) ok = ok && makeTex3(dev, f1, t);
+    for (auto &t : S.P) ok = ok && makeTex3(dev, f1, t);
+    ok = ok && makeTex3(dev, f1, S.DIV) && makeTex3(dev, f4, S.CURL);
+    if (!ok) {
+        logf("smoke: creating the 3D textures failed (this GPU/driver may not allow it)");
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+    {
+        resource_desc dd(1, 1, 1, 1, format::r32_float, 1, memory_heap::gpu_only, resource_usage::shader_resource);
+        if (!dev->create_resource(dd, nullptr, resource_usage::shader_resource, &S.dummyRes) ||
+            !dev->create_resource_view(S.dummyRes, resource_usage::shader_resource,
+                                       resource_view_desc(resource_view_type::texture_2d, format::r32_float, 0, 1, 0, 1),
+                                       &S.dummySrv)) {
+            logf("smoke: creating the dummy depth texture failed");
+            destroySim(dev);
+            S.failed = true;
+            g_smokeState = 2;
+            return false;
+        }
+    }
+    sampler_desc sd{};
+    sd.filter = filter_mode::min_mag_mip_linear;
+    sd.address_u = texture_address_mode::clamp;
+    sd.address_v = texture_address_mode::clamp;
+    sd.address_w = texture_address_mode::clamp;
+    if (!dev->create_sampler(sd, &S.smp)) {
+        logf("smoke: create_sampler failed");
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+
+    // compute layout: b0 constants, t0-t3 SRVs, u0-u1 UAVs
+    pipeline_layout_param pc[3];
+    pc[0].type = pipeline_layout_param_type::push_constants;
+    pc[0].push_constants.binding = 0;
+    pc[0].push_constants.dx_register_index = 0;
+    pc[0].push_constants.dx_register_space = 0;
+    pc[0].push_constants.count = kSimConsts;
+    pc[0].push_constants.visibility = shader_stage::compute;
+    pc[1].type = pipeline_layout_param_type::push_descriptors;
+    pc[1].push_descriptors.binding = 0;
+    pc[1].push_descriptors.dx_register_index = 0;
+    pc[1].push_descriptors.dx_register_space = 0;
+    pc[1].push_descriptors.count = 4;
+    pc[1].push_descriptors.visibility = shader_stage::compute;
+    pc[1].push_descriptors.type = descriptor_type::shader_resource_view;
+    pc[2].type = pipeline_layout_param_type::push_descriptors;
+    pc[2].push_descriptors.binding = 0;
+    pc[2].push_descriptors.dx_register_index = 0;
+    pc[2].push_descriptors.dx_register_space = 0;
+    pc[2].push_descriptors.count = 2;
+    pc[2].push_descriptors.visibility = shader_stage::compute;
+    pc[2].push_descriptors.type = descriptor_type::unordered_access_view;
+    if (!dev->create_pipeline_layout(3, pc, &S.layoutC)) {
+        logf("smoke: create_pipeline_layout (compute) failed");
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+    auto mkCs = [&](const char *entry, pipeline &out) -> bool {
+        std::vector<uint8_t> cs;
+        if (!compileFrom(kSimSource, entry, "cs_5_0", cs)) return false;
+        shader_desc sdsc{};
+        sdsc.code = cs.data();
+        sdsc.code_size = cs.size();
+        pipeline_subobject so{pipeline_subobject_type::compute_shader, 1, &sdsc};
+        if (!dev->create_pipeline(S.layoutC, 1, &so, &out)) {
+            logf("smoke: create_pipeline failed for %s", entry);
+            return false;
+        }
+        return true;
+    };
+    ok = mkCs("CSClear", S.csClear) && mkCs("CSAdvV", S.csAdvV) && mkCs("CSCurl", S.csCurl) && mkCs("CSConf", S.csConf) &&
+         mkCs("CSDiv", S.csDiv) && mkCs("CSJac", S.csJac) && mkCs("CSProj", S.csProj) && mkCs("CSAdvD", S.csAdvD);
+    if (!ok) {
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+
+    // render layout: b0 constants, t0-t1 SRVs, s0 sampler
+    pipeline_layout_param pr[3];
+    pr[0].type = pipeline_layout_param_type::push_constants;
+    pr[0].push_constants.binding = 0;
+    pr[0].push_constants.dx_register_index = 0;
+    pr[0].push_constants.dx_register_space = 0;
+    pr[0].push_constants.count = kRenderConsts;
+    pr[0].push_constants.visibility = shader_stage::pixel;
+    pr[1].type = pipeline_layout_param_type::push_descriptors;
+    pr[1].push_descriptors.binding = 0;
+    pr[1].push_descriptors.dx_register_index = 0;
+    pr[1].push_descriptors.dx_register_space = 0;
+    pr[1].push_descriptors.count = 2;
+    pr[1].push_descriptors.visibility = shader_stage::pixel;
+    pr[1].push_descriptors.type = descriptor_type::shader_resource_view;
+    pr[2].type = pipeline_layout_param_type::push_descriptors;
+    pr[2].push_descriptors.binding = 0;
+    pr[2].push_descriptors.dx_register_index = 0;
+    pr[2].push_descriptors.dx_register_space = 0;
+    pr[2].push_descriptors.count = 1;
+    pr[2].push_descriptors.visibility = shader_stage::pixel;
+    pr[2].push_descriptors.type = descriptor_type::sampler;
+    std::vector<uint8_t> vs, ps;
+    if (!compileFrom(kRenderSource, "VSMain", "vs_5_0", vs) || !compileFrom(kRenderSource, "PSMain", "ps_5_0", ps) ||
+        !dev->create_pipeline_layout(3, pr, &S.layoutR)) {
+        logf("smoke: render shader/layout setup failed");
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+    shader_desc vsd{}, psd{};
+    vsd.code = vs.data();
+    vsd.code_size = vs.size();
+    psd.code = ps.data();
+    psd.code_size = ps.size();
+    blend_desc blend{};
+    blend.blend_enable[0] = true;
+    blend.source_color_blend_factor[0] = blend_factor::one;
+    blend.dest_color_blend_factor[0] = blend_factor::one_minus_source_alpha;
+    blend.color_blend_op[0] = blend_op::add;
+    blend.source_alpha_blend_factor[0] = blend_factor::one;
+    blend.dest_alpha_blend_factor[0] = blend_factor::one_minus_source_alpha;
+    blend.alpha_blend_op[0] = blend_op::add;
+    blend.render_target_write_mask[0] = 0xF;
+    rasterizer_desc rast{};
+    rast.fill_mode = fill_mode::solid;
+    rast.cull_mode = cull_mode::none;
+    rast.depth_clip_enable = true;
+    depth_stencil_desc ds{};
+    ds.depth_enable = false;
+    ds.stencil_enable = false;
+    primitive_topology topo = primitive_topology::triangle_list;
+    format rtFormats[1] = {rtFmt};
+    pipeline_subobject subs[] = {
+        {pipeline_subobject_type::vertex_shader, 1, &vsd},
+        {pipeline_subobject_type::pixel_shader, 1, &psd},
+        {pipeline_subobject_type::blend_state, 1, &blend},
+        {pipeline_subobject_type::rasterizer_state, 1, &rast},
+        {pipeline_subobject_type::depth_stencil_state, 1, &ds},
+        {pipeline_subobject_type::primitive_topology, 1, &topo},
+        {pipeline_subobject_type::render_target_formats, 1, rtFormats},
+    };
+    if (!dev->create_pipeline(S.layoutR, static_cast<uint32_t>(sizeof(subs) / sizeof(subs[0])), subs, &S.psR)) {
+        logf("smoke: create_pipeline failed for the ray-march pass");
+        destroySim(dev);
+        S.failed = true;
+        g_smokeState = 2;
+        return false;
+    }
+    S.failed = false;
+    S.ready = true;
+    g_smokeState = 1;
+    logf("smoke: fluid solver ready (%dx%dx%d grid, %d pressure iterations)", NX, NY, NZ, kJacobi);
+    return true;
+}
+
+void ensureState(reshade::api::command_list *cmd, Tex3 &t, reshade::api::resource_usage want) {
+    if (t.state != want) {
+        cmd->barrier(t.res, t.state, want);
+        t.state = want;
+    }
+}
+
+void runPass(reshade::api::command_list *cmd, reshade::api::pipeline pipe, Tex3 *s0, Tex3 *s1, Tex3 *s2, Tex3 *s3,
+             Tex3 *u0, Tex3 *u1, const float *cb) {
+    using namespace reshade::api;
+    Sim &S = g_sim;
+    Tex3 *srvs[4] = {s0, s1, s2, s3};
+    Tex3 *uavs[2] = {u0, u1};
+    for (Tex3 *t : srvs) ensureState(cmd, *t, resource_usage::shader_resource);
+    for (Tex3 *t : uavs) ensureState(cmd, *t, resource_usage::unordered_access);
+    cmd->bind_pipeline(pipeline_stage::compute_shader, pipe);
+    resource_view sv[4] = {s0->srv, s1->srv, s2->srv, s3->srv};
+    resource_view uv[2] = {u0->uav, u1->uav};
+    descriptor_table_update a{};
+    a.binding = 0;
+    a.array_offset = 0;
+    a.count = 4;
+    a.type = descriptor_type::shader_resource_view;
+    a.descriptors = sv;
+    cmd->push_descriptors(shader_stage::compute, S.layoutC, 1, a);
+    descriptor_table_update b{};
+    b.binding = 0;
+    b.array_offset = 0;
+    b.count = 2;
+    b.type = descriptor_type::unordered_access_view;
+    b.descriptors = uv;
+    cmd->push_descriptors(shader_stage::compute, S.layoutC, 2, b);
+    cmd->push_constants(shader_stage::compute, S.layoutC, 0, 0, kSimConsts, cb);
+    cmd->dispatch(NX / 8, NY / 8, NZ / 4);
+}
+
+struct SmokeFrame {
+    float origin[3] = {0, 0, 0};
+    float cell = 0.4f;
+    int emitters = 0;
+};
+
+// One simulation step: moves the grid with the car, adds smoke at slipping tires, advances the fluid.
+bool stepSmoke(reshade::api::command_list *cmd, const rf::Frame &snap, SmokeFrame &out) {
+    Sim &S = g_sim;
+    if (snap.wheels.empty()) return false;
+    const int veh = snap.wheels[0].vehId;
+    const float cell = g_cfgCellCm / 100.0f;
+    float cx = 0, cy = 0, vx = 0, vy = 0, minGround = 1e9f;
+    int n = 0;
+    for (const auto &w : snap.wheels) {
+        if (w.vehId != veh) continue;
+        cx += w.pos[0];
+        cy += w.pos[1];
+        vx += w.vel[0];
+        vy += w.vel[1];
+        minGround = std::fmin(minGround, w.pos[2] - w.radius);
+        ++n;
+    }
+    if (n == 0) return false;
+    cx /= n; cy /= n; vx /= n; vy /= n;
+    const float ex = NX * cell, ey = NY * cell;
+    const float offx = std::fmax(-0.3f * ex, std::fmin(0.3f * ex, vx * 1.5f));
+    const float offy = std::fmax(-0.3f * ey, std::fmin(0.3f * ey, vy * 1.5f));
+    float origin[3] = {std::floor((cx - offx - ex * 0.5f) / cell) * cell, std::floor((cy - offy - ey * 0.5f) / cell) * cell,
+                       std::floor((minGround - 3.0f * cell) / cell) * cell};
+    if (!S.haveOrigin) {
+        for (int k = 0; k < 3; ++k) S.origin[k] = origin[k];
+        S.haveOrigin = true;
+    }
+    const ULONGLONG now = GetTickCount64();
+    float dt = S.lastTick ? static_cast<float>(now - S.lastTick) * 0.001f : 0.016f;
+    S.lastTick = now;
+    dt = std::fmax(0.002f, std::fmin(0.05f, dt));
+
+    float cb[kSimConsts] = {};
+    cb[0] = origin[0]; cb[1] = origin[1]; cb[2] = origin[2]; cb[3] = cell;
+    cb[4] = S.origin[0]; cb[5] = S.origin[1]; cb[6] = S.origin[2]; cb[7] = dt;
+    cb[8] = minGround - 0.03f;  // ground height
+    cb[9] = 0.35f;              // smoke fades by itself (per second)
+    cb[10] = 3.0f;              // buoyancy
+    cb[11] = 1.5f;              // vorticity confinement
+    const float emitScale = g_cfgSmokeEmit / 100.0f;
+    int ne = 0;
+    for (const auto &w : snap.wheels) {
+        if (w.vehId != veh || ne >= kEmit) continue;
+        float slipMax = std::fmax(std::fabs(w.slip), std::fabs(w.sideSlip));
+        float inten = std::fmin(1.0f, std::fmax(0.0f, (slipMax - 1.5f) / 6.0f)) * emitScale;
+        float *e = &cb[12 + 8 * ne];
+        e[0] = w.pos[0]; e[1] = w.pos[1]; e[2] = w.pos[2] - w.radius + 0.25f; e[3] = std::fmax(0.7f, 2.2f * cell);
+        e[4] = w.vel[0] * 0.35f; e[5] = w.vel[1] * 0.35f; e[6] = w.vel[2] * 0.35f + 1.2f; e[7] = inten;
+        ++ne;
+    }
+    g_smokeEmitCount = ne;
+
+    Tex3 &V0 = S.V[S.vc];
+    (void)V0;
+    auto Vc = [&]() -> Tex3 & { return S.V[S.vc]; };
+    auto Vn = [&]() -> Tex3 & { return S.V[1 - S.vc]; };
+    auto Dc = [&]() -> Tex3 & { return S.D[S.dc]; };
+    auto Dn = [&]() -> Tex3 & { return S.D[1 - S.dc]; };
+    auto Pc = [&]() -> Tex3 & { return S.P[S.pc]; };
+    auto Pn = [&]() -> Tex3 & { return S.P[1 - S.pc]; };
+
+    runPass(cmd, S.csAdvV, &Vc(), &Dc(), &Pc(), &S.CURL, &Vn(), &S.DIV, cb);        // advect velocity + add smoke
+    S.vc = 1 - S.vc;
+    runPass(cmd, S.csCurl, &Vc(), &Dc(), &Pc(), &Vn(), &S.CURL, &S.DIV, cb);        // curl
+    runPass(cmd, S.csConf, &Vc(), &Dc(), &Pc(), &S.CURL, &Vn(), &S.DIV, cb);        // vorticity confinement
+    S.vc = 1 - S.vc;
+    runPass(cmd, S.csDiv, &Vc(), &Dc(), &Pc(), &Vn(), &S.CURL, &S.DIV, cb);         // divergence
+    runPass(cmd, S.csClear, &Vc(), &Dc(), &Pn(), &S.CURL, &Vn(), &Pc(), cb);        // pressure = 0
+    for (int it = 0; it < kJacobi; ++it) {                                           // pressure solve
+        runPass(cmd, S.csJac, &Vc(), &Pc(), &S.DIV, &S.CURL, &Vn(), &Pn(), cb);
+        S.pc = 1 - S.pc;
+    }
+    runPass(cmd, S.csProj, &Vc(), &Pc(), &Dc(), &S.CURL, &Vn(), &S.DIV, cb);        // make it incompressible
+    S.vc = 1 - S.vc;
+    runPass(cmd, S.csAdvD, &Vc(), &Dc(), &Pc(), &S.CURL, &Vn(), &Dn(), cb);         // advect smoke density
+    S.dc = 1 - S.dc;
+
+    for (int k = 0; k < 3; ++k) {
+        S.origin[k] = origin[k];
+        out.origin[k] = origin[k];
+    }
+    out.cell = cell;
+    out.emitters = ne;
+    return true;
+}
+
+void camBasis(const float camRot[4], rf::Vec3 &fwd, rf::Vec3 &right, rf::Vec3 &up) {
+    float q[4] = {camRot[0], camRot[1], camRot[2], camRot[3]};
+    float len = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (len < 1e-6f) len = 1.0f;
+    for (float &c : q) c /= len;
+    q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2];  // same convention as rf::project
+    fwd = rf::rotate(q, {0, 1, 0});
+    right = rf::rotate(q, {1, 0, 0});
+    up = rf::rotate(q, {0, 0, 1});
+}
+
+void renderSmoke(reshade::api::command_list *cmd, const rf::Frame &snap, const SmokeFrame &sf, float W, float H, int nMarkers,
+                 const float *markerCb, bool useDepth, reshade::api::resource_view depthView) {
+    using namespace reshade::api;
+    Sim &S = g_sim;
+    ensureState(cmd, S.D[S.dc], resource_usage::shader_resource);
+    rf::Vec3 fwd, right, up;
+    camBasis(snap.camRot, fwd, right, up);
+    const float tanHalf = std::tan(snap.fovDeg * 0.5f * 3.14159265f / 180.0f);
+    const float aspect = W / H;
+    const float tanV = g_cfgFovVertical != 0 ? tanHalf : tanHalf / aspect;
+    const float tanH = tanV * aspect;
+    float rc[kRenderConsts] = {};
+    rc[0] = snap.camPos[0]; rc[1] = snap.camPos[1]; rc[2] = snap.camPos[2]; rc[3] = tanH;
+    rc[4] = right.x; rc[5] = right.y; rc[6] = right.z; rc[7] = tanV;
+    rc[8] = up.x; rc[9] = up.y; rc[10] = up.z; rc[11] = useDepth ? 1.0f : 0.0f;
+    rc[12] = fwd.x; rc[13] = fwd.y; rc[14] = fwd.z; rc[15] = 0.0f;
+    rc[16] = sf.origin[0]; rc[17] = sf.origin[1]; rc[18] = sf.origin[2]; rc[19] = sf.cell;
+    const float sx = 0.35f, sy = 0.25f, sz = 0.9f, sl = std::sqrt(sx * sx + sy * sy + sz * sz);
+    rc[20] = sx / sl; rc[21] = sy / sl; rc[22] = sz / sl;
+    rc[23] = 2.0f * g_cfgSmokeDensity / 100.0f;
+    const int nm = nMarkers < 6 ? nMarkers : 6;
+    for (int k = 0; k < nm; ++k) {
+        rc[24 + 4 * k + 0] = markerCb[4 + 4 * k + 0];                // pixel x
+        rc[24 + 4 * k + 1] = markerCb[4 + 4 * k + 1];                // pixel y
+        rc[24 + 4 * k + 2] = markerCb[4 + 4 * kMaxMarkers + k];      // view depth (m)
+    }
+    rc[48] = static_cast<float>(nm); rc[49] = W; rc[50] = H;
+
+    cmd->bind_pipeline(pipeline_stage::all_graphics, S.psR);
+    resource_view sv[2] = {S.D[S.dc].srv, useDepth ? depthView : S.dummySrv};
+    descriptor_table_update a{};
+    a.binding = 0;
+    a.array_offset = 0;
+    a.count = 2;
+    a.type = descriptor_type::shader_resource_view;
+    a.descriptors = sv;
+    cmd->push_descriptors(shader_stage::pixel, S.layoutR, 1, a);
+    descriptor_table_update b{};
+    b.binding = 0;
+    b.array_offset = 0;
+    b.count = 1;
+    b.type = descriptor_type::sampler;
+    b.descriptors = &S.smp;
+    cmd->push_descriptors(shader_stage::pixel, S.layoutR, 2, b);
+    cmd->push_constants(shader_stage::pixel, S.layoutR, 0, 0, kRenderConsts, rc);
+    cmd->draw(3, 1, 0, 0);
+}
+
 void dropDepthView() {  // caller holds g_viewMutex
     if (g_depthView.handle) g_viewGrave.emplace_back(g_depthView, g_frameNo + 6);
     g_depthView = {0};
@@ -452,6 +1148,7 @@ void destroyOverlayPipeline() {
         flushViewGrave(true);
         g_viewDevice = nullptr;
     }
+    destroySim(g_overlayDevice);
     if (g_pipeline.handle) g_overlayDevice->destroy_pipeline(g_pipeline);
     if (g_layout.handle) g_overlayDevice->destroy_pipeline_layout(g_layout);
     if (g_pipelineD.handle) g_overlayDevice->destroy_pipeline(g_pipelineD);
@@ -664,15 +1361,19 @@ void on_finish_effects(reshade::api::effect_runtime *runtime, reshade::api::comm
         DepthCand *vc = findCand(depthRes.handle);
         if (vc) depthState = vc->state.load();
     }
-    if (count == 0) return;
     const bool useDepth = depthRes.handle != 0 && depthView.handle != 0;
-    cb[0] = static_cast<float>(count);
-    cb[1] = useDepth ? 1.0f : 0.0f;
-    cb[2] = g_cfgDepthTolCm / 100.0f;
     g_depthActive = useDepth;
 
-    const pipeline_layout lay = useDepth ? g_layoutD : g_layout;
-    cmd_list->bind_pipeline(pipeline_stage::all_graphics, useDepth ? g_pipelineD : g_pipeline);
+    // ---- smoke simulation (compute passes), then drawing
+    SmokeFrame sf;
+    bool smokeOk = false;
+    if (g_cfgSmoke) {
+        if (!g_sim.ready && !g_sim.failed) createSim(dev, fmt);
+        if (g_sim.ready) smokeOk = stepSmoke(cmd_list, snap, sf);
+    }
+    const bool drawMarkers = g_cfgMarkers != 0 && count > 0;
+    if (!smokeOk && !drawMarkers) return;
+
     cmd_list->bind_render_targets_and_depth_stencil(1, &rtv);
     const viewport vp = {0.0f, 0.0f, W, H, 0.0f, 1.0f};
     cmd_list->bind_viewports(0, 1, &vp);
@@ -680,23 +1381,35 @@ void on_finish_effects(reshade::api::effect_runtime *runtime, reshade::api::comm
     cmd_list->bind_scissor_rects(0, 1, &sc);
     const resource_usage st = depthState ? static_cast<resource_usage>(depthState) : resource_usage::depth_stencil_write;
     bool barrierDone = false;
-    if (useDepth) {
-        if ((st & resource_usage::shader_resource_pixel) == 0) {
-            cmd_list->barrier(depthRes, st, resource_usage::shader_resource_pixel);
-            barrierDone = true;
-        }
-        descriptor_table_update upd{};
-        upd.binding = 0;
-        upd.array_offset = 0;
-        upd.count = 1;
-        upd.type = descriptor_type::shader_resource_view;
-        upd.descriptors = &depthView;
-        cmd_list->push_descriptors(shader_stage::pixel, lay, 1, upd);
+    if (useDepth && (st & resource_usage::shader_resource_pixel) == 0) {
+        cmd_list->barrier(depthRes, st, resource_usage::shader_resource_pixel);
+        barrierDone = true;
     }
-    cmd_list->push_constants(shader_stage::pixel, lay, 0, 0, kConstCount, cb);
-    cmd_list->draw(3, 1, 0, 0);
+
+    if (drawMarkers) {
+        cb[0] = static_cast<float>(count);
+        cb[1] = useDepth ? 1.0f : 0.0f;
+        cb[2] = g_cfgDepthTolCm / 100.0f;
+        const pipeline_layout lay = useDepth ? g_layoutD : g_layout;
+        cmd_list->bind_pipeline(pipeline_stage::all_graphics, useDepth ? g_pipelineD : g_pipeline);
+        if (useDepth) {
+            descriptor_table_update upd{};
+            upd.binding = 0;
+            upd.array_offset = 0;
+            upd.count = 1;
+            upd.type = descriptor_type::shader_resource_view;
+            upd.descriptors = &depthView;
+            cmd_list->push_descriptors(shader_stage::pixel, lay, 1, upd);
+        }
+        cmd_list->push_constants(shader_stage::pixel, lay, 0, 0, kConstCount, cb);
+        cmd_list->draw(3, 1, 0, 0);
+        ++g_overlayDraws;
+    }
+    if (smokeOk) {
+        renderSmoke(cmd_list, snap, sf, W, H, count, cb, useDepth, depthView);
+        ++g_overlayDraws;
+    }
     if (barrierDone) cmd_list->barrier(depthRes, resource_usage::shader_resource_pixel, st);
-    ++g_overlayDraws;
 }
 
 void on_reshade_present(reshade::api::effect_runtime *runtime) {
@@ -744,11 +1457,12 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
         maxSlip = std::fmax(maxSlip, std::fabs(w.slip));
         maxSide = std::fmax(maxSide, std::fabs(w.sideSlip));
     }
-    logf("fps=%.0f  packets=%llu bad=%llu bytes=%llu  seq=%u age=%llums  cam=(%.1f,%.1f,%.1f) fov=%.0f  wheels=%zu maxSlip=%.2f maxSide=%.2f  overlay: draws=%llu markers=%d pipeline=%s depth=%s",
+    logf("fps=%.0f  packets=%llu bad=%llu bytes=%llu  seq=%u age=%llums  cam=(%.1f,%.1f,%.1f) fov=%.0f  wheels=%zu maxSlip=%.2f maxSide=%.2f  overlay: draws=%llu markers=%d pipeline=%s depth=%s smoke=%s emit=%d",
          fps, (unsigned long long)g_packets.load(), (unsigned long long)g_bad.load(), (unsigned long long)g_bytes.load(),
          snap.seq, (unsigned long long)(now - recvTick), snap.camPos[0], snap.camPos[1], snap.camPos[2], snap.fovDeg,
          snap.wheels.size(), maxSlip, maxSide, (unsigned long long)g_overlayDraws.load(), g_lastMarkers.load(),
-         g_pipelineFailed ? "FAILED" : (g_pipeline.handle ? "ok" : "not-created"), g_depthActive.load() ? "on" : "off");
+         g_pipelineFailed ? "FAILED" : (g_pipeline.handle ? "ok" : "not-created"), g_depthActive.load() ? "on" : "off",
+         g_smokeState.load() == 1 ? "running" : (g_smokeState.load() == 2 ? "FAILED" : "off"), g_smokeEmitCount.load());
     static int dbgTick = 0;
     if ((dbgTick++ % 10) != 0) return;
     // DEBUG: where each wheel lands under both FOV readings (assumes 1920x1080).
@@ -770,7 +1484,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(hModule)) return FALSE;
             openLog(hModule);
-            logf("RealFluid add-on milestone 2b-step2 loaded");
+            logf("RealFluid add-on milestone 3 (smoke) loaded");
             reshade::register_event<reshade::addon_event::init_device>(on_init_device);
             reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
             reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
