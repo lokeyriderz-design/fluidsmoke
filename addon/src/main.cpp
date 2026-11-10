@@ -298,12 +298,12 @@ bool createOverlayPipeline(reshade::api::device *dev, reshade::api::format fmt) 
 
     blend_desc blend{};
     blend.blend_enable[0] = true;
-    blend.source_color_blend_factor = blend_factor::one;
-    blend.dest_color_blend_factor = blend_factor::one_minus_source_alpha;
-    blend.color_blend_op = blend_op::add;
-    blend.source_alpha_blend_factor = blend_factor::one;
-    blend.dest_alpha_blend_factor = blend_factor::one_minus_source_alpha;
-    blend.alpha_blend_op = blend_op::add;
+    blend.source_color_blend_factor[0] = blend_factor::one;
+    blend.dest_color_blend_factor[0] = blend_factor::one_minus_source_alpha;
+    blend.color_blend_op[0] = blend_op::add;
+    blend.source_alpha_blend_factor[0] = blend_factor::one;
+    blend.dest_alpha_blend_factor[0] = blend_factor::one_minus_source_alpha;
+    blend.alpha_blend_op[0] = blend_op::add;
     blend.render_target_write_mask[0] = 0xF;
 
     rasterizer_desc rast{};
