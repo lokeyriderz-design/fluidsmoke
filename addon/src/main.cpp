@@ -184,8 +184,24 @@ void on_bind_render_targets_and_depth_stencil(reshade::api::command_list *cmd_li
     reshade::api::device *dev = cmd_list->get_device();
     reshade::api::resource res = dev->get_resource_from_view(dsv);
     reshade::api::resource_desc d = dev->get_resource_desc(res);
-    logf("depth-stencil bound: %ux%u format=%u (ReShade format enum value)", d.texture.width, d.texture.height,
-         static_cast<unsigned>(d.texture.format));
+    logf("depth-stencil bound: %ux%u format=%u (ReShade format enum value) usage=0x%x srvFlag=%d levels=%u samples=%u",
+         d.texture.width, d.texture.height, static_cast<unsigned>(d.texture.format),
+         static_cast<unsigned>(d.usage), (d.usage & reshade::api::resource_usage::shader_resource) != 0 ? 1 : 0,
+         static_cast<unsigned>(d.texture.levels), static_cast<unsigned>(d.texture.samples));
+}
+
+// 2b step 1: only OBSERVE how the game creates its depth textures. Never modifies anything.
+std::atomic<int> g_createLogged{0};
+bool on_create_resource(reshade::api::device *, reshade::api::resource_desc &desc, reshade::api::subresource_data *,
+                        reshade::api::resource_usage) {
+    if (desc.type != reshade::api::resource_type::texture_2d) return false;
+    if ((desc.usage & reshade::api::resource_usage::depth_stencil) == 0) return false;
+    if (g_createLogged.fetch_add(1) >= 24) return false;
+    logf("depth texture created: %ux%u format=%u usage=0x%x srvFlag=%d levels=%u samples=%u",
+         desc.texture.width, desc.texture.height, static_cast<unsigned>(desc.texture.format),
+         static_cast<unsigned>(desc.usage), (desc.usage & reshade::api::resource_usage::shader_resource) != 0 ? 1 : 0,
+         static_cast<unsigned>(desc.texture.levels), static_cast<unsigned>(desc.texture.samples));
+    return false;  // false = leave the game's resource exactly as it is
 }
 
 
@@ -447,6 +463,8 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
          snap.seq, (unsigned long long)(now - recvTick), snap.camPos[0], snap.camPos[1], snap.camPos[2], snap.fovDeg,
          snap.wheels.size(), maxSlip, maxSide, (unsigned long long)g_overlayDraws.load(), g_lastMarkers.load(),
          g_pipelineFailed ? "FAILED" : (g_pipeline.handle ? "ok" : "not-created"));
+    static int dbgTick = 0;
+    if ((dbgTick++ % 10) != 0) return;
     // DEBUG: where each wheel lands under both FOV readings (assumes 1920x1080).
     const int dbgFovVert = g_cfgFovVertical.load();
     logf("  DBG camRot=(%.3f,%.3f,%.3f,%.3f) fovVertical=%d", snap.camRot[0], snap.camRot[1], snap.camRot[2], snap.camRot[3], dbgFovVert);
@@ -466,13 +484,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
         case DLL_PROCESS_ATTACH:
             if (!reshade::register_addon(hModule)) return FALSE;
             openLog(hModule);
-            logf("RealFluid add-on milestone 2a loaded");
+            logf("RealFluid add-on milestone 2b-step1 loaded");
             reshade::register_event<reshade::addon_event::init_device>(on_init_device);
             reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
             reshade::register_event<reshade::addon_event::reshade_present>(on_reshade_present);
             reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_finish_effects);
             reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
                 on_bind_render_targets_and_depth_stencil);
+            reshade::register_event<reshade::addon_event::create_resource>(on_create_resource);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_addon(hModule);
