@@ -18,9 +18,9 @@ FetchContent_Declare(reshade
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(reshade)
 
-add_library(realfluid SHARED src/main.cpp src/protocol.hpp)
+add_library(realfluid SHARED src/main.cpp src/protocol.hpp src/projection.hpp)
 target_include_directories(realfluid PRIVATE src ${reshade_SOURCE_DIR}/include)
-target_link_libraries(realfluid PRIVATE ws2_32)
+target_link_libraries(realfluid PRIVATE ws2_32 d3dcompiler)
 target_compile_definitions(realfluid PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
     target_compile_options(realfluid PRIVATE /W3 /permissive-)
