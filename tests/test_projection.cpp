@@ -21,9 +21,9 @@ int main() {
     // horizontal FOV 90: a point 10 m ahead and 10 m right sits on the right edge
     p = rf::project(cam, idq, 90, false, W, H, {110, 210, 50});
     CHECK(p.ok && near(p.px, W, 0.01f));
-    // 90 deg about Z (counter-clockwise): forward (0,1,0) -> (-1,0,0)
+    // quaternion is world->camera (inverted): this one makes the camera look along +X
     const float s = 0.70710678f; const float q90[4] = {0, 0, s, s};
-    p = rf::project(cam, q90, 65, true, W, H, {90, 200, 50});
+    p = rf::project(cam, q90, 65, true, W, H, {110, 200, 50});
     CHECK(p.ok && near(p.px, 960) && near(p.py, 540));
     p = rf::project(cam, q90, 65, true, W, H, {100, 200, 50 + 5}); // not in front of (0 depth) -> rejected
     CHECK(!p.ok);

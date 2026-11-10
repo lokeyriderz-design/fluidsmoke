@@ -37,6 +37,9 @@ inline Projected project(const float camPos[3], const float camRot[4], float fov
     float len = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
     if (len < 1e-6f) return r;
     for (float &c : q) c /= len;
+    // Measured from a real BeamNG log: the camera quaternion maps WORLD -> CAMERA, so use its
+    // inverse (conjugate) to get the camera axes in world space.
+    q[0] = -q[0]; q[1] = -q[1]; q[2] = -q[2];
 
     Vec3 fwd = rotate(q, {0, 1, 0}), right = rotate(q, {1, 0, 0}), up = rotate(q, {0, 0, 1});
     Vec3 d = p - Vec3{camPos[0], camPos[1], camPos[2]};
