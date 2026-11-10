@@ -447,6 +447,15 @@ void on_reshade_present(reshade::api::effect_runtime *runtime) {
          snap.seq, (unsigned long long)(now - recvTick), snap.camPos[0], snap.camPos[1], snap.camPos[2], snap.fovDeg,
          snap.wheels.size(), maxSlip, maxSide, (unsigned long long)g_overlayDraws.load(), g_lastMarkers.load(),
          g_pipelineFailed ? "FAILED" : (g_pipeline.handle ? "ok" : "not-created"));
+    // DEBUG: where each wheel lands under both FOV readings (assumes 1920x1080).
+    logf("  DBG camRot=(%.3f,%.3f,%.3f,%.3f) fovVertical=%d", snap.camRot[0], snap.camRot[1], snap.camRot[2], snap.camRot[3], g_cfgFovVertical);
+    for (const auto &w : snap.wheels) {
+        rf::Vec3 c{w.pos[0], w.pos[1], w.pos[2] - w.radius};
+        rf::Projected pv = rf::project(snap.camPos, snap.camRot, snap.fovDeg, true, 1920.f, 1080.f, c);
+        rf::Projected ph = rf::project(snap.camPos, snap.camRot, snap.fovDeg, false, 1920.f, 1080.f, c);
+        logf("  DBG veh=%d wheel=%d pos=(%.2f,%.2f,%.2f) r=%.2f  vertFov->(%.0f,%.0f) ok=%d  horFov->(%.0f,%.0f) ok=%d  depth=%.2f",
+             w.vehId, w.wheelIdx, w.pos[0], w.pos[1], w.pos[2], w.radius, pv.px, pv.py, pv.ok ? 1 : 0, ph.px, ph.py, ph.ok ? 1 : 0, pv.depth);
+    }
 }
 
 }  // namespace
